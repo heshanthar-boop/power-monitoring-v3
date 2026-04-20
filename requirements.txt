@@ -1,0 +1,21 @@
+# Core Modbus / serial
+pymodbus==3.6.9
+pyserial==3.5
+
+# Charting (Tkinter backend used by ui/ legacy; Qt backend auto-selected for ui_qt/)
+matplotlib>=3.7.5,<4
+
+# Tkinter theme
+sv-ttk>=2.6.0
+
+# Excel export (reports)
+openpyxl>=3.1.0
+
+# PDF report generation
+reportlab>=4.0
+
+# XML / HTML parsing (reports_html, lxml-based templating)
+lxml>=4.9
+
+# MQTT publisher (optional — app degrades gracefully if absent)
+paho-mqtt>=1.6,<3

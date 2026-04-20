@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Build / dist
+build/
+dist/
+*.spec
+
+# Logs / runtime
+logs/
+*.log
+
+# Database files (generated at runtime)
+*.db
+*.sqlite
+*.sqlite3
+
+# Config with secrets
+firebase_key.json
+firebase_key*.json
+*.env
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Test cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Installer artifacts
+*.iss
+Output/
