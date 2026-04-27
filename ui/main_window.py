@@ -8,6 +8,7 @@ from utils.resources import resource_path
 from utils.version import APP_NAME, VERSION
 
 from ui.styles import apply_styles, get_theme
+from ui.command_palette import CommandPalette
 from ui.meter_selector import MeterSelector
 from ui.operator_home import OperatorHomeTab
 from ui.dashboard import DashboardTab
@@ -30,6 +31,7 @@ from ui.comm_view import CommTab
 from ui.connectivity_view import ConnectivityTab
 from ui.access_view import AccessControlTab
 from ui.status_bar import StatusBar
+from ui.tooltips import attach_tooltip
 from utils.stale_override import set_stale_override
 from utils.write_guard import lock_writes
 from ui.widgets.scrollable_container import ScrollableContainer
@@ -42,6 +44,7 @@ from utils.paths import logs_dir
 from utils.monitors import list_monitors, geometry_for_monitor
 from utils.power import set_keep_awake, apply_from_cfg as apply_power_from_cfg
 from utils.app_health import summarize_health
+from ui.ux_labels import bus_health_badge, bus_health_detail, plain_comm_state
 
 from core.supervisor import Supervisor
 from core.snapshot_report import SnapshotReporter
@@ -119,6 +122,7 @@ class MainWindow(tk.Tk):
         self._last_activity_ts = time.time()
         self._closing = False
         self._logout_requested = False
+        self._command_palette = None
         self._audit("SESSION_START", f"role={self.session_role} timeout_sec={self.session_timeout_sec}")
 
         # UI-thread Supervisor: detects dead/stuck worker and restarts safely.
@@ -257,6 +261,50 @@ class MainWindow(tk.Tk):
             return "Owner"
         return "Operator"
 
+    def _session_status_text(self, remaining_mins: int | None = None) -> str:
+        base = f"{self.session_username} ({self._role_label()})"
+        if remaining_mins is None:
+            text = base
+        else:
+            text = f"{base} | idle logout {int(max(1, remaining_mins))}m"
+        max_len = 54
+        if len(text) <= max_len:
+            return text
+        if remaining_mins is None:
+            return text[: max_len - 3].rstrip() + "..."
+        suffix = f" | idle logout {int(max(1, remaining_mins))}m"
+        room = max(10, max_len - len(suffix) - 3)
+        short_base = (base[:room].rstrip() + "...") if len(base) > room else base
+        return f"{short_base}{suffix}"
+
+    @staticmethod
+    def _sanitize_header_text(value: str, *, strip_leading_sep: bool = False) -> str:
+        """Normalize UI header text and remove common mojibake artifacts."""
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        # Common UTF-8/CP1252 mojibake sequences observed in field configs.
+        replacements = {
+            "â€“": "-",
+            "â€”": "-",
+            "Â": "",
+            "\ufeff": "",
+            "\ufffd": "",
+        }
+        for bad, good in replacements.items():
+            text = text.replace(bad, good)
+        text = " ".join(text.split())
+        if strip_leading_sep:
+            text = text.lstrip("|/- ").strip()
+        return text
+
+    @classmethod
+    def _short_header_text(cls, value: str, limit: int, *, strip_leading_sep: bool = False) -> str:
+        text = cls._sanitize_header_text(value, strip_leading_sep=strip_leading_sep)
+        if len(text) <= int(limit):
+            return text
+        return text[: max(0, int(limit) - 3)].rstrip() + "..."
+
     def _can_show_page(self, key: str) -> bool:
         k = str(key or "").strip().lower()
         if not self._has_permission(k):
@@ -291,6 +339,89 @@ class MainWindow(tk.Tk):
             return ("home", "dashboard", "reports", "status")
         return ("home", "status", "dashboard")
 
+    def _quick_nav_items(self) -> list[dict]:
+        catalog = [
+            ("Start", [
+                ("home", "Start Here", "recommended actions"),
+            ]),
+            ("Operations", [
+                ("dashboard", "Dashboard", "live readings and trend charts"),
+                ("status", "Meter Status", "communication and meter health"),
+                ("data_graphs", "Data & Graphs", "historian trends and analysis"),
+            ]),
+            ("Insights", [
+                ("analytics", "Analytics", "efficiency and power quality"),
+                ("intelligence", "Intelligence", "system guidance"),
+                ("solar_kpi", "Solar KPI", "solar generation performance"),
+                ("hydro_kpi", "Hydro KPI", "hydro generation performance"),
+                ("load_kpi", "Load KPI", "load profile performance"),
+            ]),
+            ("Events", [
+                ("alarms", "Active Alarms", "faults and acknowledgements"),
+                ("incident_summary", "Incident Summary", "event timeline"),
+                ("protection", "Protection Rules", "limits and protection logic"),
+            ]),
+            ("Records", [
+                ("logging", "Data Logger", "recording and historian status"),
+                ("reports", "Reports", "PDF and export outputs"),
+                ("journal", "Event Journal", "operator and system log"),
+            ]),
+            ("Settings", [
+                ("setup", "Setup", "site and station settings"),
+                ("comm", "Communication", "meter connection setup"),
+                ("connectivity", "Connectivity", "free online monitoring outputs"),
+                ("email", "Email Alerts", "mail report delivery"),
+                ("access_control", "User & Access", "users and permissions"),
+            ]),
+        ]
+
+        items = []
+        seen = set()
+        nav_buttons = getattr(self, "_nav_buttons", {}) or {}
+        for group, pages in catalog:
+            for key, label, hint in pages:
+                if not self._can_show_page(key):
+                    continue
+                nav_label = label
+                try:
+                    btn = nav_buttons.get(key)
+                    nav_label = str(getattr(btn, "_full_text", label) or label)
+                except Exception:
+                    nav_label = label
+                items.append({"key": key, "label": nav_label, "group": group, "hint": hint})
+                seen.add(key)
+
+        for key in sorted((getattr(self, "_page_widgets", {}) or {}).keys()):
+            if key in seen or not self._can_show_page(key):
+                continue
+            items.append({
+                "key": key,
+                "label": key.replace("_", " ").title(),
+                "group": "Other",
+                "hint": "available page",
+            })
+        return items
+
+    def _show_command_palette(self, _event=None):
+        try:
+            existing = getattr(self, "_command_palette", None)
+            if existing is not None and existing.winfo_exists():
+                existing.focus_search()
+                return "break"
+        except Exception:
+            pass
+
+        items = self._quick_nav_items()
+        if not items:
+            self._notify_operator("No pages are available for this login.")
+            return "break"
+
+        try:
+            self._command_palette = CommandPalette(self, items, on_select=lambda key: self.show_page(key))
+        except Exception:
+            self._notify_operator("Quick Go is unavailable right now.")
+        return "break"
+
     def _on_user_activity(self, _evt=None):
         self._last_activity_ts = time.time()
 
@@ -300,11 +431,21 @@ class MainWindow(tk.Tk):
         self.bind_all("<KeyPress>", self._on_user_activity, add="+")
         self.bind_all("<Control-b>", lambda _e: self.toggle_sidebar(), add="+")
         # ── Operator keyboard shortcuts ───────────────────────────────────────
+        # Ctrl+K - Quick Go page search
         # F1  — Quick Health overlay (bus state, alarms, live kW/V, logging)
         # F2  — Jump to Comm tab (re-connect / check comms)
         # F3  — ACK all unacknowledged alarms
         # F5  — Refresh current page (calls on_show if available)
         # Ctrl+L — Jump to Logging tab
+        self.bind_all("<Control-k>", self._show_command_palette, add="+")
+        self.bind_all("<Control-K>", self._show_command_palette, add="+")
+        self.bind_all("<Control-0>", lambda _e: self._dashboard_layout_hotkey("both"), add="+")
+        self.bind_all("<Control-1>", lambda _e: self._dashboard_layout_hotkey("chart1"), add="+")
+        self.bind_all("<Control-2>", lambda _e: self._dashboard_layout_hotkey("chart2"), add="+")
+        self.bind_all("<Control-t>", lambda _e: self._dashboard_tiles_hotkey(), add="+")
+        self.bind_all("<Control-T>", lambda _e: self._dashboard_tiles_hotkey(), add="+")
+        self.bind_all("<Control-Shift-S>", lambda _e: self._dashboard_save_charts_hotkey(), add="+")
+        self.bind_all("<Control-Shift-s>", lambda _e: self._dashboard_save_charts_hotkey(), add="+")
         self.bind_all("<F1>",        lambda _e: self._show_quick_health(), add="+")
         self.bind_all("<F2>",        lambda _e: self.show_page("comm"),    add="+")
         self.bind_all("<F3>",        lambda _e: self._ack_all_hotkey(),    add="+")
@@ -314,6 +455,45 @@ class MainWindow(tk.Tk):
         self.bind_all("<Control-p>", lambda _e: self._print_snapshot_hotkey(), add="+")
 
     # ── Keyboard shortcut handlers ────────────────────────────────────────────
+
+    def _dashboard_layout_hotkey(self, mode: str):
+        if getattr(self, "_current_page_key", None) != "dashboard":
+            return None
+        try:
+            dash = getattr(self, "tab_dashboard", None)
+            if dash is not None and hasattr(dash, "set_current_chart_layout"):
+                dash.set_current_chart_layout(mode)
+                labels = {"both": "both charts", "chart1": "left chart", "chart2": "right chart"}
+                self._notify_operator(f"Dashboard chart view: {labels.get(mode, mode)}")
+                return "break"
+        except Exception:
+            pass
+        return None
+
+    def _dashboard_tiles_hotkey(self):
+        if getattr(self, "_current_page_key", None) != "dashboard":
+            return None
+        try:
+            dash = getattr(self, "tab_dashboard", None)
+            if dash is not None and hasattr(dash, "toggle_current_chart_focus"):
+                dash.toggle_current_chart_focus()
+                self._notify_operator("Dashboard tiles/charts view toggled.")
+                return "break"
+        except Exception:
+            pass
+        return None
+
+    def _dashboard_save_charts_hotkey(self):
+        if getattr(self, "_current_page_key", None) != "dashboard":
+            return None
+        try:
+            dash = getattr(self, "tab_dashboard", None)
+            if dash is not None and hasattr(dash, "save_current_visible_charts"):
+                dash.save_current_visible_charts()
+                return "break"
+        except Exception:
+            pass
+        return None
 
     def _ack_all_hotkey(self):
         """F3 — acknowledge all unacknowledged alarms; show brief toast."""
@@ -454,13 +634,15 @@ class MainWindow(tk.Tk):
             # ── Bus / Comms ───────────────────────────────────────────────────
             _section("COMMUNICATIONS")
             try:
-                from ui.ux_labels import plain_comm_state
                 bus = self.worker.get_bus_health() if self.worker else {}
-                bus_state = plain_comm_state((bus or {}).get("state", "OFFLINE"))
+                bus_state = bus_health_badge(bus)
                 age = (bus or {}).get("age", None)
+                detail = bus_health_detail(bus)
                 age_txt = f"  (last rx {age:.1f}s ago)" if age is not None else ""
-                bus_color = t.good if "ONLINE" in bus_state.upper() else t.alarm
+                bus_color = t.good if "LIVE" in bus_state.upper() else (t.warn if "RECONNECT" in bus_state.upper() or "OLD DATA" in bus_state.upper() else t.alarm)
                 _row("Bus state:", f"{bus_state}{age_txt}", bus_color)
+                if detail:
+                    _row("Bus detail:", detail, t.text_muted)
             except Exception:
                 _row("Bus state:", "—")
 
@@ -497,10 +679,14 @@ class MainWindow(tk.Tk):
                         agg_vals = snap.get("values") or {}
                 kw   = agg_vals.get("kW")
                 vavg = agg_vals.get("Vavg")
-                freq = agg_vals.get("freq") or agg_vals.get("Hz")
-                _row("Total kW:",   f"{kw:.1f} kW"  if isinstance(kw,   float) else "—")
-                _row("Vavg (L-N):", f"{vavg:.1f} V" if isinstance(vavg, float) else "—")
-                _row("Frequency:",  f"{freq:.2f} Hz" if isinstance(freq, float) else "—")
+                freq = agg_vals.get("Frequency")
+                if freq is None:
+                    freq = agg_vals.get("freq")
+                if freq is None:
+                    freq = agg_vals.get("Hz")
+                _row("Total kW:",   f"{float(kw):.1f} kW"  if isinstance(kw,   (int, float)) else "—")
+                _row("Vavg (L-N):", f"{float(vavg):.1f} V" if isinstance(vavg, (int, float)) else "—")
+                _row("Frequency:",  f"{float(freq):.2f} Hz" if isinstance(freq, (int, float)) else "—")
             except Exception:
                 _row("Live data:", "—")
 
@@ -526,6 +712,11 @@ class MainWindow(tk.Tk):
                 ("F3", "ACK All alarms"),
                 ("F5", "Refresh current page"),
                 ("Ctrl+L", "Go to Logging tab"),
+                ("Ctrl+0", "Dashboard: show both charts"),
+                ("Ctrl+1", "Dashboard: focus left chart"),
+                ("Ctrl+2", "Dashboard: focus right chart"),
+                ("Ctrl+T", "Dashboard: toggle tiles/charts"),
+                ("Ctrl+Shift+S", "Dashboard: save visible charts"),
                 ("Ctrl+B", "Toggle sidebar"),
             ]
             ref = tk.Frame(body, bg=t.bg)
@@ -696,7 +887,7 @@ class MainWindow(tk.Tk):
             pass
 
         win = tk.Toplevel(self)
-        win.title(f"{self.APP_NAME} â€” {key.capitalize()}")
+        win.title(f"{self.APP_NAME} - {key.capitalize()}")
         try:
             win.geometry(geometry_for_monitor(mon))
         except Exception:
@@ -734,6 +925,8 @@ class MainWindow(tk.Tk):
                     alarm_engine=self.alarm_engine,
                     event_journal=getattr(self, "event_journal", None),
                     protection_engine=getattr(self, "protection_engine", None),
+                    on_save_config=lambda *_, **__: self._persist_config("dashboard_external"),
+                    on_notify=self._notify_operator,
                 )
                 tab.pack(fill="both", expand=True)
                 # force immediate render once the window shows
@@ -1015,9 +1208,7 @@ class MainWindow(tk.Tk):
             def _on_click(e):
                 if getattr(self, "_sidebar_compact", False):
                     _hide_tip()
-                    self.toggle_sidebar()
-                else:
-                    self.show_page(key)
+                self.show_page(key)
                 return "break"
 
             for w in (item, sym_lbl, txt_lbl, bar):
@@ -1335,6 +1526,10 @@ class MainWindow(tk.Tk):
         if not plant_name:
             plant_name = self.APP_NAME
 
+        plant_name = self._short_header_text(plant_name, 40)
+        location = self._short_header_text(location, 28, strip_leading_sep=True)
+        description = self._short_header_text(description, 28, strip_leading_sep=True)
+
         # Single-line styled display (reduces top-bar height):
         # Plant (large) + Location (medium) + Description (small)
         line = ttk.Frame(left)
@@ -1350,7 +1545,7 @@ class MainWindow(tk.Tk):
 
         self.lbl_site_location = ttk.Label(
             line,
-            text=(f"  â€”  {location}" if (location or "").strip() else ""),
+            text=(f"  |  {location}" if (location or "").strip() else ""),
             font=("Segoe UI", 10, "bold"),
             style="HeaderLine.TLabel",
         )
@@ -1368,7 +1563,7 @@ class MainWindow(tk.Tk):
         # We give the clock its own expanding frame so it stays centered,
         # independent of right-side controls.
         mid = ttk.Frame(top)
-        mid.pack(side="left", fill="x", expand=True)
+        mid.pack(side="left", fill="x", expand=True, padx=(14, 10))
 
         self.clock_var = tk.StringVar(value="")
         self.lbl_clock = ttk.Label(
@@ -1385,12 +1580,30 @@ class MainWindow(tk.Tk):
 
         session_badge = ttk.Frame(right)
         session_badge.pack(side="right", anchor="e", padx=(10, 0))
-        self.session_status_var = tk.StringVar(value=f"{self.session_username} ({self._role_label()})")
+        self.session_status_var = tk.StringVar(value=self._session_status_text())
         ttk.Label(
             session_badge,
             textvariable=self.session_status_var,
             style="HeaderLineMuted.TLabel",
         ).pack(side="left", padx=(0, 8))
+        quick_wrap = tk.Frame(session_badge, bg="#4da6ff", padx=1, pady=1)
+        quick_wrap.pack(side="left", padx=(0, 6))
+        self._quick_go_btn = tk.Label(
+            quick_wrap,
+            text="FIND",
+            bg="#122033",
+            fg="#b8e3ff",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        self._quick_go_btn.pack(side="left")
+        self._quick_go_btn.bind("<Enter>", lambda _e: self._quick_go_btn.config(bg="#1b3553", fg="#ffffff"))
+        self._quick_go_btn.bind("<Leave>", lambda _e: self._quick_go_btn.config(bg="#122033", fg="#b8e3ff"))
+        self._quick_go_btn.bind("<Button-1>", self._show_command_palette)
+        attach_tooltip(self._quick_go_btn, "Quick navigation. Shortcut: Ctrl+K")
+
         logout_wrap = tk.Frame(session_badge, bg="#4da6ff", padx=1, pady=1)
         logout_wrap.pack(side="left")
         self._logout_btn = tk.Label(
@@ -1490,6 +1703,8 @@ class MainWindow(tk.Tk):
                 alarm_engine=self.alarm_engine,
                 event_journal=getattr(self, "event_journal", None),
                 protection_engine=self.protection_engine,
+                on_save_config=lambda *_, **__: self._persist_config("dashboard"),
+                on_notify=self._notify_operator,
             )
         if self._has_permission("status"):
             self._page_widgets["status"] = StatusTab(
@@ -1703,15 +1918,22 @@ class MainWindow(tk.Tk):
         self._nav_buttons = {}
         self._build_sidebar()
 
-        # Sidebar is click-toggled only. Start compact and do not run hover/autohide polling.
+        # Sidebar is click-toggled only. Default expanded for clarity on operator PCs.
         self._sidebar_mouse_inside = False
         self._sidebar_autohide_job = None
         self._sidebar_enter_job = None
         self._sidebar_leave_job = None
         self._sidebar_compact = False   # force _set_sidebar_compact to act
-        self._set_sidebar_compact(True)
+        start_compact = bool(((self.cfg.get("ui") or {}).get("sidebar_compact", False)))
+        self._set_sidebar_compact(start_compact)
         try:
-            self.sidebar.configure(width=getattr(self, "_sidebar_w_compact", 44))
+            self.sidebar.configure(
+                width=getattr(
+                    self,
+                    "_sidebar_w_compact" if start_compact else "_sidebar_w_expanded",
+                    44 if start_compact else 210,
+                )
+            )
         except Exception:
             pass
 
@@ -1749,20 +1971,20 @@ class MainWindow(tk.Tk):
             if fb_pub is not None:
                 site = self.cfg.get("site", {})
                 fb_pub.push_site_info(
-                    plant_name=str(site.get("plant_name", "") or ""),
-                    location=str(site.get("location", "") or ""),
+                    plant_name=self._sanitize_header_text(site.get("plant_name", "")),
+                    location=self._sanitize_header_text(site.get("location", ""), strip_leading_sep=True),
                 )
         except Exception:
             pass
 
         # Refresh Site / Plant Information header labels with real values
         site = self.cfg.get("site", {}) or {}
-        plant_name  = str(site.get("plant_name",  "") or "").strip() or self.APP_NAME
-        location    = str(site.get("location",    "") or "").strip()
-        description = str(site.get("description", "") or "").strip()
+        plant_name = self._short_header_text(site.get("plant_name", ""), 40) or self.APP_NAME
+        location = self._short_header_text(site.get("location", ""), 28, strip_leading_sep=True)
+        description = self._short_header_text(site.get("description", ""), 28, strip_leading_sep=True)
         try:
             self.lbl_site_name.config(text=plant_name)
-            self.lbl_site_location.config(text=(f"  â€”  {location}" if location else ""))
+            self.lbl_site_location.config(text=(f"  |  {location}" if location else ""))
             self.lbl_site_desc.config(text=(f"  |  {description}" if description else ""))
         except Exception:
             pass
@@ -2154,7 +2376,8 @@ class MainWindow(tk.Tk):
             dash = self._page_widgets.get("dashboard")
             if dash is not None and hasattr(dash, "update_system_health"):
                 bus = self.worker.get_bus_health() if self.worker else {}
-                comm_state   = str((bus or {}).get("state", "OFFLINE") or "OFFLINE")
+                comm_state   = bus_health_badge(bus) if bus else "OFFLINE"
+                comm_detail  = bus_health_detail(bus) if bus else ""
                 last_rx_age  = (bus or {}).get("age", None)
                 # historian last write age
                 hist_size_mb = getattr(self.logging_engine, "db_size_mb", None) if self.logging_engine else None
@@ -2175,6 +2398,7 @@ class MainWindow(tk.Tk):
                 restart_count = len(getattr(self.supervisor, "_restart_ts_hist", []) or []) if self.supervisor else 0
                 dash.update_system_health({
                     "comm_state":    comm_state,
+                    "comm_detail":   comm_detail,
                     "last_rx_age":   last_rx_age,
                     "hist_size_mb":  hist_size_mb,
                     "hist_last_s":   hist_last_s,
@@ -2198,6 +2422,12 @@ class MainWindow(tk.Tk):
                 or getattr(self, "_mqtt_publisher", None) is not None
             ):
                 worker_state = str(getattr(self.worker, "status", "UNKNOWN") or "UNKNOWN") if self.worker else "NO_WORKER"
+                if self.worker:
+                    try:
+                        bus = self.worker.get_bus_health() or {}
+                        worker_state = str((bus or {}).get("state", "") or worker_state)
+                    except Exception:
+                        pass
                 meter_count  = len([m for m in self.meters if bool(getattr(m, "enabled", True))])
                 if getattr(self, "_remote_sync", None) is not None:
                     self._remote_sync.publish_app_status(worker_state, meter_count)
@@ -2393,9 +2623,9 @@ class MainWindow(tk.Tk):
                 idle = max(0.0, time.time() - float(self._last_activity_ts or time.time()))
                 remaining = max(0, int(float(self.session_timeout_sec) - idle))
                 mins = max(1, int((remaining + 59) // 60))
-                self.session_status_var.set(f"{self.session_username} ({self._role_label()}) | idle logout {mins}m")
+                self.session_status_var.set(self._session_status_text(mins))
             except Exception:
-                self.session_status_var.set(f"{self.session_username} ({self._role_label()})")
+                self.session_status_var.set(self._session_status_text())
         # 500ms is smooth enough without wasting CPU
         self.after(500, self._tick_clock)
 
@@ -2522,6 +2752,12 @@ class MainWindow(tk.Tk):
         target = not bool(getattr(self, "_sidebar_compact", False))
         self._set_sidebar_compact(target)
         self._animate_sidebar_width(compact=target)
+        try:
+            ui = self.cfg.setdefault("ui", {})
+            ui["sidebar_compact"] = bool(target)
+            self._persist_config("sidebar")
+        except Exception:
+            pass
         try:
             self._after_sidebar_layout_change()
             self._audit("SIDEBAR_TOGGLE", f"compact={1 if target else 0}")

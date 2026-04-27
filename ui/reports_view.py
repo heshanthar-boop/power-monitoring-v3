@@ -729,9 +729,9 @@ class ReportsTab(ttk.Frame):
         # Prune from engine DB by finding the matching row
         rows = self.engine.list_history(limit=500)
         for r in rows:
-            if r.generation_time == gen_time and hasattr(self.engine, "_db"):
+            if r.generation_time == gen_time:
                 try:
-                    self.engine._db._prune_by_id(r.report_id)
+                    self.engine.delete_report(r.report_id, delete_file=False)
                 except Exception:
                     pass
                 break
