@@ -1,11 +1,12 @@
 """
 Dashboard with 16 configurable tiles and 2 trend charts.
-Supports right-click parameter selection and time window control.
+Supports double-click/right-click parameter selection and time window control.
 """
 from __future__ import annotations
 import math
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk
 from collections import deque
 from typing import Dict, List, Optional, Any, Tuple
@@ -25,6 +26,7 @@ from ui.key_registry import (
     canonical_key,
     canonical_keys,
 )
+from ui.tooltips import attach_tooltip
 from utils.health import meter_is_fresh, stale_seconds
 from utils.logger import setup_logger
 from utils.log_once import log_once
@@ -49,8 +51,88 @@ _FAULT_STRIPE_NORMAL = "#0b1220"  # matches control-room dark background → vis
 
 # Tab badge suffixes (appended to meter name in notebook tab)
 _TAB_BADGE_NONE  = ""
-_TAB_BADGE_WARN  = "  ⚠"
-_TAB_BADGE_ALARM = "  ●"
+_TAB_BADGE_WARN  = "  WARN"
+_TAB_BADGE_ALARM = "  ALARM"
+
+DASHBOARD_PRESETS = {
+    "overview": {
+        "label": "Overview",
+        "tip": "Balanced operator view for normal monitoring.",
+        "tiles": [
+            "kW", "kVA", "kVAr", "PFavg", "Frequency", "Vavg", "Iavg", "Import_kWh",
+            "Export_kWh", "Net_kWh", "V1N", "V2N", "V3N", "I1", "I2", "I3",
+        ],
+        "chart1": ["kW", "kVA", "kVAr", "PFavg"],
+        "chart2": ["Vavg", "Iavg", "Frequency"],
+        "chart1_window": 15,
+        "chart2_window": 60,
+    },
+    "power": {
+        "label": "Power",
+        "tip": "Active, apparent, reactive power and power factor analysis.",
+        "tiles": [
+            "kW", "kVA", "kVAr", "PFavg", "kW1", "kW2", "kW3", "kVA1",
+            "kVA2", "kVA3", "kVAr1", "kVAr2", "kVAr3", "PF1", "PF2", "PF3",
+        ],
+        "chart1": ["kW", "kVA", "kVAr"],
+        "chart2": ["PFavg", "PF1", "PF2", "PF3"],
+        "chart1_window": 15,
+        "chart2_window": 60,
+    },
+    "voltage": {
+        "label": "Voltage",
+        "tip": "Voltage balance, frequency and voltage distortion.",
+        "tiles": [
+            "Vavg", "Average Voltage LL", "V1N", "V2N", "V3N", "V12", "V23", "V31",
+            "Frequency", "Vavg_ref", "Freq_ref", "THD_V_worst", "THD Voltage V1N",
+            "THD Voltage V2N", "THD Voltage V3N", "Harmonic Voltage Worst",
+        ],
+        "chart1": ["Vavg", "V1N", "V2N", "V3N"],
+        "chart2": ["Frequency", "THD_V_worst", "Harmonic Voltage Worst"],
+        "chart1_window": 15,
+        "chart2_window": 60,
+    },
+    "current": {
+        "label": "Current",
+        "tip": "Phase current balance and current distortion.",
+        "tiles": [
+            "Iavg", "I1", "I2", "I3", "I1_total", "I2_total", "I3_total", "kW",
+            "PFavg", "THD_I_worst", "THD Current I1", "THD Current I2", "THD Current I3",
+            "Harmonic Current Worst", "RunHour", "Frequency",
+        ],
+        "chart1": ["Iavg", "I1", "I2", "I3"],
+        "chart2": ["THD_I_worst", "THD Current I1", "THD Current I2", "THD Current I3"],
+        "chart1_window": 15,
+        "chart2_window": 60,
+    },
+    "quality": {
+        "label": "Quality",
+        "tip": "Power quality indicators for fast fault diagnosis.",
+        "tiles": [
+            "PFavg", "Frequency", "Vavg", "Iavg", "THD_V_worst", "THD_I_worst",
+            "Harmonic Voltage Worst", "Harmonic Current Worst", "THD Voltage V1N",
+            "THD Voltage V2N", "THD Voltage V3N", "THD Current I1", "THD Current I2",
+            "THD Current I3", "V1N", "I1",
+        ],
+        "chart1": ["Vavg", "Frequency", "PFavg"],
+        "chart2": ["THD_V_worst", "THD_I_worst", "Harmonic Voltage Worst", "Harmonic Current Worst"],
+        "chart1_window": 60,
+        "chart2_window": 60,
+    },
+    "energy": {
+        "label": "Energy",
+        "tip": "Energy counters and production/consumption review.",
+        "tiles": [
+            "Import_kWh", "Export_kWh", "Net_kWh", "Today_kWh", "Lifetime_kWh",
+            "Total Net kVAh", "Total Net kVArh", "kW", "kVA", "kVAr", "PFavg",
+            "RunHour", "Vavg", "Iavg", "Frequency", "THD_V_worst",
+        ],
+        "chart1": ["Import_kWh", "Export_kWh", "Net_kWh"],
+        "chart2": ["kW", "kVA", "kVAr"],
+        "chart1_window": 60,
+        "chart2_window": 15,
+    },
+}
 
 
 class FaultBannerFrame(tk.Frame):
@@ -75,13 +157,17 @@ class FaultBannerFrame(tk.Frame):
     _FALLBACK_BG = "#0b1220"
 
     def __init__(self, parent):
-        super().__init__(parent, height=2)
+        super().__init__(parent, height=0)
+        try:
+            self.pack_propagate(False)
+            self.grid_propagate(False)
+        except Exception:
+            pass
         self._pills: list = []
 
     # ------------------------------------------------------------------
     def update_alarms(self, events: list) -> str:
-        """Rebuild pills from *events* (list of AlarmEvent).  Returns tab badge."""
-        # Destroy previous pills
+        """Render a single compact active-fault summary. Returns tab badge."""
         for p in self._pills:
             try:
                 p.destroy()
@@ -94,37 +180,63 @@ class FaultBannerFrame(tk.Frame):
                 parent_bg = str(self.master.cget("background"))
             except Exception:
                 parent_bg = self._FALLBACK_BG
-            self.configure(bg=parent_bg, height=2)
+            self.configure(bg=parent_bg, height=0)
+            try:
+                self.grid_remove()
+            except Exception:
+                pass
             return _TAB_BADGE_NONE
 
         worst = "ALARM" if any(getattr(e, "severity", "") == "ALARM" for e in events) else "WARN"
         strip_bg = self._STRIP_BG.get(worst, self._FALLBACK_BG)
-        self.configure(bg=strip_bg, height=24)
+        try:
+            self.grid()
+        except Exception:
+            pass
+        self.configure(bg=strip_bg, height=12)
 
-        # Header label
-        tk.Label(
-            self, text="  ACTIVE FAULTS:",
+        alarm_count = sum(1 for e in events if getattr(e, "severity", "") == "ALARM")
+        warn_count = max(0, len(events) - alarm_count)
+        summary = f"FAULTS: {len(events)} active"
+        if alarm_count:
+            summary += f" | {alarm_count} alarm"
+        if warn_count:
+            summary += f" | {warn_count} warning"
+        lbl = tk.Label(
+            self, text=f"  {summary}",
             fg=self._STRIP_FG, bg=strip_bg,
-            font=("Segoe UI", 8),
-        ).pack(side="left", padx=(4, 2), pady=3)
+            font=("Segoe UI", 7, "bold"),
+        )
+        lbl.pack(side="left", padx=(4, 5), pady=0)
+        self._pills.append(lbl)
 
-        # One pill per alarm, sorted: ALARM first then alphabetical
         sorted_evs = sorted(
             events,
             key=lambda e: (0 if getattr(e, "severity", "") == "ALARM" else 1,
                            getattr(e, "code", "")),
         )
-        for ev in sorted_evs:
+        max_codes = 4
+        for ev in sorted_evs[:max_codes]:
             pill_bg = self._PILL_BG.get(getattr(ev, "severity", "WARN"), "#6b7280")
-            # Strip PROT_ prefix for readability: "PROT_UV_M1" → "UV_M1"
-            short = str(getattr(ev, "code", "?")).replace("PROT_", "")
+            short = str(getattr(ev, "code", "?")).replace("PROT_", "").strip()
+            if len(short) > 18:
+                short = short[:15].rstrip() + "..."
             pill = tk.Label(
                 self, text=f" {short} ",
                 fg="white", bg=pill_bg,
-                font=("Consolas", 8, "bold"),
+                font=("Consolas", 7, "bold"),
             )
-            pill.pack(side="left", padx=2, pady=3)
+            pill.pack(side="left", padx=1, pady=0)
             self._pills.append(pill)
+        extra = len(sorted_evs) - max_codes
+        if extra > 0:
+            more = tk.Label(
+                self, text=f" +{extra} ",
+                fg=self._STRIP_FG, bg=strip_bg,
+                font=("Consolas", 7, "bold"),
+            )
+            more.pack(side="left", padx=1, pady=0)
+            self._pills.append(more)
 
         return _TAB_BADGE_ALARM if worst == "ALARM" else _TAB_BADGE_WARN
 
@@ -433,12 +545,17 @@ class TilesPanel(ttk.Frame):
     Panel with 16 configurable tiles (2 rows x 8 columns).
     Each tile can be right-clicked to select parameter.
     """
+    MAX_TILES = 16
     
-    def __init__(self, parent, cfg: dict, view_key: str, get_available_keys_fn):
+    def __init__(self, parent, cfg: dict, view_key: str, get_available_keys_fn, on_config_change=None):
         super().__init__(parent)
         self.cfg = cfg
         self.view_key = view_key  # "TOTAL" or meter_id
         self.get_available_keys_fn = get_available_keys_fn
+        self.on_config_change = on_config_change
+        self._tile_count = self.MAX_TILES
+        self._display_style = "tiles"
+        self._raw_numbers = False
         
         self.tiles: List[Dict] = []  # List of tile info dicts
         # Per-tile sparkline ring buffers — keyed by tile index.
@@ -446,43 +563,301 @@ class TilesPanel(ttk.Frame):
         self._spark_bufs: Dict[int, _SparklineBuffer] = {}
         self._build()
         self._load_config()
+
+    @staticmethod
+    def _equivalent_key(key: str) -> str:
+        """Collapse aliases that are the same operator-facing parameter."""
+        canon = canonical_key(key)
+        return {
+            "PF": "PFavg",
+            "PF_total": "PFavg",
+            "Total_kW": "kW",
+            "Total_kVA": "kVA",
+            "Total_kVAr": "kVAr",
+            "I1_total": "I1",
+            "I2_total": "I2",
+            "I3_total": "I3",
+            "RunHour_total": "RunHour",
+        }.get(canon, canon)
+
+    @classmethod
+    def _tile_identity(cls, key: str) -> Tuple[str, str, str]:
+        canon = canonical_key(key)
+        label = " ".join(str(key_label(canon) or canon).lower().split())
+        unit = str(key_unit(canon) or "").lower().strip()
+        return (cls._equivalent_key(canon), label, unit)
+
+    @staticmethod
+    def _title_text(key: str) -> str:
+        label = key_label(key)
+        if len(label) <= 24:
+            return label
+        return label[:21].rstrip() + "..."
+
+    def _unique_tile_keys(self, preferred: List[str]) -> List[str]:
+        """Return 16 unique, useful tile keys, preserving saved order first."""
+        try:
+            available = list(self.get_available_keys_fn() or [])
+        except Exception:
+            available = []
+        if self.view_key == "TOTAL":
+            candidates = list(preferred or []) + available + DEFAULT_TILE_KEYS + COMMON_KEYS
+        else:
+            candidates = list(preferred or []) + DEFAULT_TILE_KEYS + available + COMMON_KEYS
+
+        out: List[str] = []
+        seen = set()
+        for raw in candidates:
+            canon = canonical_key(raw)
+            if not canon:
+                continue
+            ident = self._tile_identity(canon)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            out.append(canon)
+            if len(out) >= self.MAX_TILES:
+                break
+        return out[:self.MAX_TILES]
     
     def _get_tile_keys(self) -> List[str]:
-        """Get tile keys from config or use defaults."""
+        """Get de-duplicated tile keys from config or use defaults."""
         dash_cfg = self.cfg.setdefault("dashboard", {})
         tiles_cfg = dash_cfg.setdefault("tiles", {})
         key = str(self.view_key)
         saved = tiles_cfg.get(key)
         normalized = canonical_keys(saved or [])
-        if normalized:
-            return normalized
-        if self.view_key == "TOTAL":
-            defaults = canonical_keys(list(self.get_available_keys_fn())[:16])
-            if not defaults:
-                defaults = canonical_keys(DEFAULT_TILE_KEYS)
-        else:
-            defaults = canonical_keys(DEFAULT_TILE_KEYS)
-        tiles_cfg[key] = defaults
-        return defaults
+        base = normalized if normalized else canonical_keys(DEFAULT_TILE_KEYS)
+        unique = self._unique_tile_keys(base)
+        tiles_cfg[key] = unique
+        return unique
     
     def _save_tile_keys(self, keys: List[str]):
         """Save tile keys to config."""
         dash_cfg = self.cfg.setdefault("dashboard", {})
         tiles_cfg = dash_cfg.setdefault("tiles", {})
-        tiles_cfg[str(self.view_key)] = canonical_keys(keys)
+        tiles_cfg[str(self.view_key)] = self._unique_tile_keys(canonical_keys(keys))
+        self._notify_config_change()
+
+    def _notify_config_change(self) -> None:
+        if callable(self.on_config_change):
+            try:
+                self.on_config_change()
+            except Exception:
+                pass
+
+    def apply_keys(self, keys: List[str]) -> None:
+        """Apply a full tile layout and save it."""
+        selected = self._unique_tile_keys(canonical_keys(keys or []))
+        for i, tile in enumerate(self.tiles):
+            if i < len(selected):
+                self._apply_tile_key(tile, selected[i])
+                self._clear_sparkline(i)
+        self._save_tile_keys([t["key"] for t in self.tiles])
+
+    def _apply_tile_key(self, tile: Dict, key: str) -> None:
+        canon = canonical_key(key)
+        tile["key"] = canon
+        tile["title_label"].config(text=self._title_text(canon))
+        try:
+            tile["unit_label"].config(text=key_unit(canon))
+        except Exception:
+            pass
+
+    def _clear_sparkline(self, tile_index: int) -> None:
+        self._spark_bufs.pop(tile_index, None)
+        try:
+            self.tiles[tile_index]["sparkline"].delete("all")
+        except Exception:
+            pass
+
+    def set_display_options(self, tile_count: int = 16, style: str = "tiles", raw_numbers: bool = False) -> None:
+        try:
+            count = int(tile_count)
+        except Exception:
+            count = self.MAX_TILES
+        self._tile_count = max(1, min(self.MAX_TILES, count))
+        self._display_style = str(style or "tiles").strip().lower()
+        if self._display_style not in {"tiles", "gauges"}:
+            self._display_style = "tiles"
+        self._raw_numbers = bool(raw_numbers)
+        self._arrange_tiles()
+        self._apply_style_visibility()
+
+    def _arrange_tiles(self) -> None:
+        visible = max(1, min(self.MAX_TILES, int(self._tile_count or self.MAX_TILES)))
+        if visible <= 8:
+            cols = 8
+        elif visible <= 12:
+            cols = 6
+        else:
+            cols = 8
+        rows = max(1, int(math.ceil(visible / float(cols))))
+
+        for col in range(8):
+            self.columnconfigure(col, weight=1 if col < cols else 0)
+        for row in range(2):
+            self.rowconfigure(row, weight=1 if row < rows else 0)
+
+        for idx, tile in enumerate(self.tiles):
+            frame = tile.get("frame")
+            if frame is None:
+                continue
+            if idx >= visible:
+                try:
+                    frame.grid_remove()
+                except Exception:
+                    pass
+                continue
+            row = idx // cols
+            col = idx % cols
+            try:
+                frame.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
+            except Exception:
+                pass
+
+    def _apply_style_visibility(self) -> None:
+        gauge_mode = self._display_style == "gauges"
+        for idx, tile in enumerate(self.tiles):
+            if idx >= self._tile_count:
+                continue
+            gauge = tile.get("gauge_canvas")
+            value_lbl = tile.get("value_label")
+            unit_lbl = tile.get("unit_label")
+            spark = tile.get("sparkline")
+            try:
+                if gauge_mode:
+                    if value_lbl is not None:
+                        value_lbl.pack_forget()
+                    if unit_lbl is not None:
+                        unit_lbl.pack_forget()
+                    if spark is not None:
+                        spark.pack_forget()
+                    if gauge is not None:
+                        gauge.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+                else:
+                    if gauge is not None:
+                        gauge.pack_forget()
+                    if value_lbl is not None:
+                        value_lbl.pack(padx=4, pady=(2, 0))
+                    if unit_lbl is not None:
+                        unit_lbl.pack(padx=4, pady=(0, 2))
+                    if spark is not None:
+                        spark.pack(fill="x", padx=4, pady=(0, 4))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _format_raw_value(value) -> str:
+        try:
+            return f"{float(value):,.4f}"
+        except Exception:
+            return str(value)
+
+    def _draw_gauge(self, tile: Dict, key: str, value, color: str) -> None:
+        canvas = tile.get("gauge_canvas")
+        if canvas is None:
+            return
+        try:
+            canvas.delete("all")
+            w = max(88, int(canvas.winfo_width() or 0))
+            h = max(88, int(canvas.winfo_height() or 0))
+            size = min(w - 8, h - 8)
+            left = (w - size) / 2.0
+            top = (h - size) / 2.0
+            right = left + size
+            bottom = top + size
+            canvas.create_oval(left, top, right, bottom, outline="#1f2937", width=6)
+            value_f = float(value) if isinstance(value, (int, float)) else None
+            frac = 0.0
+            if value_f is not None:
+                grp = _infer_unit_group(key_label(key) or key)
+                if grp == "PF":
+                    frac = max(0.0, min(1.0, value_f / 1.0))
+                elif grp == "Hz":
+                    frac = max(0.0, min(1.0, (value_f - 45.0) / 10.0))
+                elif grp == "THD":
+                    frac = max(0.0, min(1.0, value_f / 20.0))
+                else:
+                    buf = self._spark_bufs.get(tile.get("index"))
+                    samples = []
+                    try:
+                        samples = [abs(float(v)) for v in (buf.values(20) if buf else []) if isinstance(v, (int, float)) and float(v) == float(v)]
+                    except Exception:
+                        samples = []
+                    peak = max(samples) if samples else max(abs(value_f), 1.0)
+                    frac = max(0.0, min(1.0, abs(value_f) / max(peak, 1e-9)))
+            canvas.create_arc(
+                left, top, right, bottom,
+                start=220, extent=-260,
+                style="arc", outline=color, width=7,
+            )
+            canvas.create_arc(
+                left, top, right, bottom,
+                start=220, extent=-(260 * frac),
+                style="arc", outline="#38bdf8" if color == "#4da6ff" else color, width=7,
+            )
+            if value_f is None:
+                text = "--"
+            elif self._raw_numbers:
+                text = self._format_raw_value(value_f)
+            else:
+                text = self._format_compact_value(value_f)
+            canvas.create_text(w / 2.0, h / 2.0 - 6, text=text, fill="#e5e7eb", font=("Segoe UI", 11, "bold"))
+            unit = key_unit(key)
+            if unit:
+                canvas.create_text(w / 2.0, h / 2.0 + 14, text=unit, fill="#9ca3af", font=("Segoe UI", 8))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _format_compact_value(fv: float) -> str:
+        if abs(fv) >= 10000:
+            return f"{fv:,.0f}"
+        if abs(fv) >= 1000:
+            return f"{fv:,.1f}"
+        if abs(fv) >= 100:
+            return f"{fv:.1f}"
+        if abs(fv) >= 10:
+            return f"{fv:.2f}"
+        return f"{fv:.3f}"
+
+    @staticmethod
+    def _value_font_size(text: str) -> int:
+        t = str(text or "").strip()
+        n = len(t)
+        if n <= 7:
+            return 22
+        if n <= 10:
+            return 18
+        if n <= 13:
+            return 16
+        return 14
+
+    def _fit_value_label(self, label_widget, text: str) -> None:
+        size = self._value_font_size(text)
+        try:
+            if int(getattr(label_widget, "_font_size", 0) or 0) == size:
+                return
+            current = label_widget.cget("font")
+            try:
+                base = tkfont.nametofont(current).actual()
+                family = str(base.get("family") or "Segoe UI")
+                weight = str(base.get("weight") or "bold")
+            except Exception:
+                family = "Segoe UI"
+                weight = "bold"
+            label_widget.configure(font=(family, size, weight))
+            label_widget._font_size = size
+        except Exception:
+            pass
     
     def _load_config(self):
         """Load tile configuration."""
         saved_keys = self._get_tile_keys()
         for i, tile in enumerate(self.tiles):
             if i < len(saved_keys):
-                k = saved_keys[i]
-                tile["key"] = k
-                tile["title_label"].config(text=key_label(k))
-                try:
-                    tile["unit_label"].config(text=key_unit(k))
-                except Exception:
-                    pass
+                self._apply_tile_key(tile, saved_keys[i])
     
     def _build(self):
         """Build 16 tiles in 2 rows x 8 columns."""
@@ -490,7 +865,7 @@ class TilesPanel(ttk.Frame):
         for col in range(8):
             self.columnconfigure(col, weight=1)
         for row in range(2):
-            self.rowconfigure(row, weight=0)
+            self.rowconfigure(row, weight=1)
 
         try:
             t = __import__("ui.styles", fromlist=["get_theme"]).get_theme()
@@ -516,7 +891,7 @@ class TilesPanel(ttk.Frame):
             hdr = tk.Frame(tile_frame, bg=_card_bg)
             hdr.pack(fill="x", padx=4, pady=(2, 0))
 
-            title_lbl = ttk.Label(hdr, text=key_label(key_name), style="TileTitle.TLabel")
+            title_lbl = ttk.Label(hdr, text=self._title_text(key_name), style="TileTitle.TLabel")
             title_lbl.pack(side="left", anchor="w")
 
             # Quality dot — tiny colored canvas circle, top-right
@@ -528,7 +903,7 @@ class TilesPanel(ttk.Frame):
             dot_id = dot_canvas.create_oval(1, 1, 9, 9, fill="#5e5a56", outline="")
 
             # ── Value (large) ─────────────────────────────────────────────────────
-            value_lbl = ttk.Label(tile_frame, text="—", style="TileValue.TLabel")
+            value_lbl = ttk.Label(tile_frame, text="--", style="TileValue.TLabel")
             value_lbl.pack(padx=4, pady=(2, 0))
 
             # ── Unit label (below value) ──────────────────────────────────────────
@@ -544,12 +919,21 @@ class TilesPanel(ttk.Frame):
             # Rendered by _draw_sparkline() on every update() call.
             spark_canvas = tk.Canvas(
                 tile_frame,
-                width=56, height=18,
+                width=64, height=18,
                 bg=_card_bg,
                 highlightthickness=0,
                 bd=0,
             )
-            spark_canvas.pack(padx=4, pady=(0, 4))
+            spark_canvas.pack(fill="x", padx=4, pady=(0, 4))
+
+            gauge_canvas = tk.Canvas(
+                tile_frame,
+                width=96, height=92,
+                bg=_card_bg,
+                highlightthickness=0,
+                bd=0,
+            )
+            gauge_canvas.pack_forget()
 
             tile_info = {
                 "index": i,
@@ -562,14 +946,17 @@ class TilesPanel(ttk.Frame):
                 "dot_canvas": dot_canvas,
                 "dot_id": dot_id,
                 "sparkline": spark_canvas,
+                "gauge_canvas": gauge_canvas,
                 "_card_bg": _card_bg,
             }
             self.tiles.append(tile_info)
 
-            # Right-click on any part of the tile to pick parameter
-            _hint = "Right-click to change parameter"
+            # Let operators discover parameter changes without reading documentation.
+            _hint = "Double-click or right-click to change this tile parameter."
             for widget in [tile_frame, hdr, title_lbl, value_lbl, unit_lbl]:
                 widget.bind("<Button-3>", lambda e, idx=i: self._show_context_menu(e, idx))
+                widget.bind("<Double-Button-1>", lambda e, idx=i: self._show_context_menu(e, idx))
+                attach_tooltip(widget, _hint)
                 try:
                     widget.bind("<Enter>", lambda e, w=tile_frame: w.configure(cursor="hand2"))
                     widget.bind("<Leave>", lambda e, w=tile_frame: w.configure(cursor=""))
@@ -596,20 +983,25 @@ class TilesPanel(ttk.Frame):
         canon = canonical_key(key)
         if not canon:
             return
-        tile["key"] = canon
-        tile["title_label"].config(text=key_label(canon))
-        try:
-            tile["unit_label"].config(text=key_unit(canon))
-        except Exception:
-            pass
+        old_key = canonical_key(tile.get("key", ""))
+        new_ident = self._tile_identity(canon)
+
+        duplicate_idx = None
+        for idx, other in enumerate(self.tiles):
+            if idx == tile_index:
+                continue
+            if self._tile_identity(other.get("key", "")) == new_ident:
+                duplicate_idx = idx
+                break
+
+        if duplicate_idx is not None and old_key:
+            self._apply_tile_key(self.tiles[duplicate_idx], old_key)
+            self._clear_sparkline(duplicate_idx)
+
+        self._apply_tile_key(tile, canon)
 
         # Reset sparkline buffer so stale history from the old key doesn't show.
-        self._spark_bufs.pop(tile_index, None)
-        # Clear the canvas immediately so it doesn't linger.
-        try:
-            tile["sparkline"].delete("all")
-        except Exception:
-            pass
+        self._clear_sparkline(tile_index)
 
         # Save to config
         keys = [t["key"] for t in self.tiles]
@@ -655,12 +1047,17 @@ class TilesPanel(ttk.Frame):
 
             if not data_valid or not values:
                 # Show quality state text, muted; push invalid sample so sparkline shows a gap.
-                value_lbl.config(text="—", foreground=dot_color)
+                value_lbl.config(text="--", foreground=dot_color)
+                self._fit_value_label(value_lbl, "--")
                 spark_buf.push_invalid()
                 try:
-                    _draw_sparkline(tile["sparkline"], spark_buf.values(10), dot_color, 56, 18)
+                    sw = max(56, int(tile["sparkline"].winfo_width() or 0))
+                    sh = max(18, int(tile["sparkline"].winfo_height() or 0))
+                    _draw_sparkline(tile["sparkline"], spark_buf.values(10), dot_color, sw, sh)
                 except Exception:
                     pass
+                if self._display_style == "gauges":
+                    self._draw_gauge(tile, key_canon, None, dot_color)
                 continue
 
             v = None
@@ -675,35 +1072,36 @@ class TilesPanel(ttk.Frame):
                 # Format based on magnitude — keep it compact for tiles
                 try:
                     fv = float(v)
-                    if abs(fv) >= 10000:
-                        text = f"{fv:,.0f}"
-                    elif abs(fv) >= 1000:
-                        text = f"{fv:,.1f}"
-                    elif abs(fv) >= 100:
-                        text = f"{fv:.1f}"
-                    elif abs(fv) >= 10:
-                        text = f"{fv:.2f}"
-                    else:
-                        text = f"{fv:.3f}"
+                    text = self._format_raw_value(fv) if self._raw_numbers else self._format_compact_value(fv)
                 except Exception:
                     text = str(v)
                 value_lbl.config(text=text, foreground=value_color)
+                self._fit_value_label(value_lbl, text)
                 # Push valid sample and redraw sparkline.
                 spark_buf.push(fv)
                 try:
-                    _draw_sparkline(tile["sparkline"], spark_buf.values(10), value_color, 56, 18)
+                    sw = max(56, int(tile["sparkline"].winfo_width() or 0))
+                    sh = max(18, int(tile["sparkline"].winfo_height() or 0))
+                    _draw_sparkline(tile["sparkline"], spark_buf.values(10), value_color, sw, sh)
                 except Exception:
                     pass
+                if self._display_style == "gauges":
+                    self._draw_gauge(tile, key_canon, fv, value_color)
             else:
                 if values and key_canon not in values:
                     log_once(logger, f"tile_missing_{key_canon}", "warning",
                              f"Tile key missing: '{key_canon}'. Available keys sample: {list(values.keys())[:12]}")
-                value_lbl.config(text="—", foreground=dot_color)
+                value_lbl.config(text="--", foreground=dot_color)
+                self._fit_value_label(value_lbl, "--")
                 spark_buf.push_invalid()
                 try:
-                    _draw_sparkline(tile["sparkline"], spark_buf.values(10), dot_color, 56, 18)
+                    sw = max(56, int(tile["sparkline"].winfo_width() or 0))
+                    sh = max(18, int(tile["sparkline"].winfo_height() or 0))
+                    _draw_sparkline(tile["sparkline"], spark_buf.values(10), dot_color, sw, sh)
                 except Exception:
                     pass
+                if self._display_style == "gauges":
+                    self._draw_gauge(tile, key_canon, None, dot_color)
 
     def set_fault_states(self, states: Dict[str, str]) -> None:
         """
@@ -739,12 +1137,14 @@ class TrendChartPair(ttk.Frame):
     """
     
     def __init__(self, parent, cfg: dict, view_key: str, 
-                 get_available_keys_fn, trend_manager: TrendManager):
+                 get_available_keys_fn, trend_manager: TrendManager, on_config_change=None):
         super().__init__(parent)
         self.cfg = cfg
         self.view_key = view_key
         self.get_available_keys_fn = get_available_keys_fn
         self.trend_manager = trend_manager
+        self.on_config_change = on_config_change
+        self._normalizing_chart_pair = False
         
         self.charts: List[TrendChartFrame] = []
         self._build()
@@ -764,14 +1164,76 @@ class TrendChartPair(ttk.Frame):
     
     def _save_trend_config(self):
         """Save trend config."""
+        if self._normalizing_chart_pair:
+            return
+        self._ensure_distinct_primary_keys()
         dash_cfg = self.cfg.setdefault("dashboard", {})
         trends_cfg = dash_cfg.setdefault("trends", {})
+        def _saved_overlays(chart):
+            limit = int(getattr(chart, "max_overlay_keys", 4) or 4)
+            out = []
+            taken = {canonical_key(getattr(chart, "selected_key", "") or "")}
+            for raw in list(getattr(chart, "overlay_keys", []) or [])[:limit]:
+                canon = canonical_key(raw)
+                if canon and canon not in taken:
+                    out.append(canon)
+                    taken.add(canon)
+            return out
         trends_cfg[str(self.view_key)] = {
             "chart1_key": canonical_key(self.charts[0].selected_key),
             "chart2_key": canonical_key(self.charts[1].selected_key),
             "chart1_window": self.charts[0].window_minutes,
             "chart2_window": self.charts[1].window_minutes,
+            "chart1_overlays": _saved_overlays(self.charts[0]),
+            "chart2_overlays": _saved_overlays(self.charts[1]),
         }
+        if callable(self.on_config_change):
+            try:
+                self.on_config_change()
+            except Exception:
+                pass
+
+    def _candidate_chart_keys(self) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        try:
+            keys = list(self.get_available_keys_fn() or [])
+        except Exception:
+            keys = []
+        for raw in list(keys) + list(COMMON_CHART_KEYS):
+            canon = canonical_key(raw)
+            if canon and canon not in seen:
+                seen.add(canon)
+                out.append(canon)
+        return out
+
+    def _ensure_distinct_primary_keys(self) -> None:
+        """Avoid duplicate primary parameters across the two visible charts."""
+        if self._normalizing_chart_pair or len(self.charts) < 2:
+            return
+        left = canonical_key(getattr(self.charts[0], "selected_key", "") or "")
+        right = canonical_key(getattr(self.charts[1], "selected_key", "") or "")
+        if not left or not right or left != right:
+            return
+        replacement = None
+        for cand in self._candidate_chart_keys():
+            if cand != left:
+                replacement = cand
+                break
+        if not replacement:
+            return
+        self._normalizing_chart_pair = True
+        try:
+            try:
+                self.charts[1]._select_key(replacement)
+            except Exception:
+                self.charts[1].set_key(replacement)
+                try:
+                    self.charts[1]._request_config_refresh(20)
+                except Exception:
+                    pass
+        finally:
+            self._normalizing_chart_pair = False
     
     def _load_config(self):
         """Load saved configuration."""
@@ -780,6 +1242,58 @@ class TrendChartPair(ttk.Frame):
         self.charts[0].set_window(cfg.get("chart1_window", 60))
         self.charts[1].set_key(cfg.get("chart2_key", "Import_kWh"))
         self.charts[1].set_window(cfg.get("chart2_window", 60))
+        self._ensure_distinct_primary_keys()
+        for chart, cfg_key in ((self.charts[0], "chart1_overlays"), (self.charts[1], "chart2_overlays")):
+            limit = int(getattr(chart, "max_overlay_keys", 4) or 4)
+            taken = {canonical_key(getattr(chart, "selected_key", "") or "")}
+            overlays = []
+            for raw in list(cfg.get(cfg_key, []) or []):
+                canon = canonical_key(raw)
+                if canon and canon not in taken:
+                    overlays.append(canon)
+                    taken.add(canon)
+                if len(overlays) >= limit:
+                    break
+            try:
+                chart.overlay_keys = overlays
+            except Exception:
+                pass
+
+    @staticmethod
+    def _preset_trace_keys(keys: List[str], limit: int = 5) -> List[str]:
+        traces = []
+        for raw in keys or []:
+            canon = canonical_key(raw)
+            if canon and canon not in traces:
+                traces.append(canon)
+            if len(traces) >= limit:
+                break
+        return traces
+
+    def apply_preset(
+        self,
+        chart1_keys: List[str],
+        chart2_keys: List[str],
+        chart1_window: int = 60,
+        chart2_window: int = 60,
+    ) -> None:
+        """Apply chart trace presets and save the trend layout."""
+        for chart, keys, window in (
+            (self.charts[0], chart1_keys, chart1_window),
+            (self.charts[1], chart2_keys, chart2_window),
+        ):
+            traces = self._preset_trace_keys(keys, limit=1 + int(getattr(chart, "max_overlay_keys", 4) or 4))
+            if traces:
+                chart.set_key(traces[0])
+                chart.overlay_keys = traces[1:]
+            try:
+                chart.set_window(window)
+                chart._update_header()
+                chart._request_config_refresh(20)
+            except Exception:
+                pass
+        self._ensure_distinct_primary_keys()
+        self._save_trend_config()
     
     def _build(self):
         """Build two side-by-side charts."""
@@ -820,6 +1334,54 @@ class TrendChartPair(ttk.Frame):
                 justify="center",
             )
             notice.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(2, 4))
+
+    def set_layout_mode(self, mode: str = "both") -> None:
+        """Switch chart pair layout without adding dashboard controls."""
+        mode = str(mode or "both").strip().lower()
+        if mode not in {"both", "chart1", "chart2"}:
+            mode = "both"
+        try:
+            for ch in self.charts:
+                ch.grid_remove()
+            if mode == "both":
+                # Reset both columns to equal weight + no minimum size constraint.
+                # columnspan must be explicitly 1 to clear any prior columnspan=2.
+                self.columnconfigure(0, weight=1, minsize=0)
+                self.columnconfigure(1, weight=1, minsize=0)
+                self.charts[0].grid(row=0, column=0, columnspan=1, padx=2, pady=2, sticky="nsew")
+                self.charts[1].grid(row=0, column=1, columnspan=1, padx=2, pady=2, sticky="nsew")
+            elif mode == "chart1":
+                self.columnconfigure(0, weight=1, minsize=0)
+                self.columnconfigure(1, weight=0, minsize=0)
+                self.charts[0].grid(row=0, column=0, columnspan=2, padx=2, pady=2, sticky="nsew")
+            else:  # chart2
+                self.columnconfigure(0, weight=1, minsize=0)
+                self.columnconfigure(1, weight=0, minsize=0)
+                self.charts[1].grid(row=0, column=0, columnspan=2, padx=2, pady=2, sticky="nsew")
+            # Force geometry recalculation before matplotlib sizes its canvas.
+            # Without this, the chart that renders first can grab all the space
+            # and the second one appears cropped on the next redraw cycle.
+            try:
+                self.update_idletasks()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def save_visible_snapshots(self) -> List[str]:
+        """Save snapshots for charts that are currently mapped."""
+        paths: List[str] = []
+        for chart in self.charts:
+            try:
+                if not bool(chart.winfo_ismapped()):
+                    continue
+                if hasattr(chart, "save_snapshot_auto"):
+                    path = chart.save_snapshot_auto()
+                    if path:
+                        paths.append(path)
+            except Exception:
+                pass
+        return paths
     
     def update_charts(
         self,
@@ -841,51 +1403,59 @@ class TrendChartPair(ttk.Frame):
             key = chart.selected_key
             key_canon = canonical_key(key)
             window = chart.window_minutes
-            
-            
+            trace_keys = [key_canon] if key_canon else []
+            try:
+                for ok in getattr(chart, "overlay_keys", []) or []:
+                    okc = canonical_key(ok)
+                    if okc and okc not in trace_keys:
+                        trace_keys.append(okc)
+            except Exception:
+                pass
 
             # Push new data point (SCADA-grade):
             # - only push numeric values when data is valid (OK)
             # - on OK <-> invalid transitions, TrendManager inserts a NaN marker to break the line
             if values:
-                v = None
-                try:
-                    v = values.get(key_canon)
-                    if v is None and key_canon != key:
-                        v = values.get(key)
-                except Exception:
+                for push_key in trace_keys:
                     v = None
-
-                if data_valid and isinstance(v, (int, float)):
                     try:
-                        self.trend_manager.push_sample(meter_id, key_canon, now, value=float(v), valid=True)
+                        v = values.get(push_key)
+                        if v is None and push_key == key_canon and key_canon != key:
+                            v = values.get(key)
                     except Exception:
-                        log_once(logger, f"trend_push_fail_{meter_id}_{key_canon}", "warning",
-                                 f"Trend push failed for meter {meter_id} key {key_canon}")
-                else:
-                    # Invalid/stale/offline: do not push numeric values (prevents flat lies).
-                    # We still notify the buffer about invalid state so it can break the line once.
-                    try:
-                        self.trend_manager.push_sample(meter_id, key_canon, now, value=None, valid=False)
-                    except Exception:
-                        pass
+                        v = None
 
-                    # Only log missing keys when we are in valid mode; otherwise it creates noise during comm loss.
-                    if data_valid and values and key_canon not in values and v is None:
-                        log_once(logger, f"trend_missing_{meter_id}_{key_canon}", "warning",
-                                 f"Trend key missing: meter {meter_id} key '{key_canon}'. Available keys sample: {list(values.keys())[:12]}")
-                    elif data_valid and v is not None and not isinstance(v, (int, float)):
-                        log_once(logger, f"trend_non_numeric_{meter_id}_{key_canon}", "warning",
-                                 f"Trend value not numeric: meter {meter_id} key '{key_canon}' value={v}")
+                    if data_valid and isinstance(v, (int, float)):
+                        try:
+                            self.trend_manager.push_sample(meter_id, push_key, now, value=float(v), valid=True)
+                        except Exception:
+                            log_once(logger, f"trend_push_fail_{meter_id}_{push_key}", "warning",
+                                     f"Trend push failed for meter {meter_id} key {push_key}")
+                    else:
+                        # Invalid/stale/offline: do not push numeric values (prevents flat lies).
+                        # We still notify the buffer about invalid state so it can break the line once.
+                        try:
+                            self.trend_manager.push_sample(meter_id, push_key, now, value=None, valid=False)
+                        except Exception:
+                            pass
+
+                        # Only log missing keys when we are in valid mode; otherwise it creates noise during comm loss.
+                        if data_valid and values and push_key not in values and v is None:
+                            log_once(logger, f"trend_missing_{meter_id}_{push_key}", "warning",
+                                     f"Trend key missing: meter {meter_id} key '{push_key}'. Available keys sample: {list(values.keys())[:12]}")
+                        elif data_valid and v is not None and not isinstance(v, (int, float)):
+                            log_once(logger, f"trend_non_numeric_{meter_id}_{push_key}", "warning",
+                                     f"Trend value not numeric: meter {meter_id} key '{push_key}' value={v}")
 
             else:
                 # No values dict at all (e.g., meter hasn't produced any values yet or is offline).
                 # We still notify invalid state so long gaps / comm loss won't be drawn as a straight line.
                 if (not data_valid) or force_push:
-                    try:
-                        self.trend_manager.push_sample(meter_id, key_canon, now, value=None, valid=False)
-                    except Exception:
-                        pass
+                    for push_key in trace_keys:
+                        try:
+                            self.trend_manager.push_sample(meter_id, push_key, now, value=None, valid=False)
+                        except Exception:
+                            pass
 
             # Always set quality state (cheap; keeps overlays correct when you come back)
             chart.set_quality_state(quality_state)
@@ -905,15 +1475,9 @@ class TrendChartPair(ttk.Frame):
 
             # Get series and update chart (only when drawable)
             # Primary + overlays (Graph+ feel) — keep CPU bounded.
-            keys = [key_canon]
-            try:
-                ovs = getattr(chart, "overlay_keys", []) or []
-                for ok in ovs:
-                    okc = canonical_key(ok)
-                    if okc and okc not in keys:
-                        keys.append(okc)
-            except Exception:
-                pass
+            keys = trace_keys
+            if not keys:
+                continue
 
             series = []
             v_list = []
@@ -1030,7 +1594,8 @@ class SystemHealthWidget(tk.Frame):
     def update_health(self, data: dict) -> None:
         """
         data keys (all optional):
-          comm_state    str   "ONLINE" / "RECOVERING" / "OFFLINE"
+          comm_state    str   "LIVE" / "RECONNECTING" / "OFFLINE"
+          comm_detail   str   operator-facing bus message
           last_rx_age   float seconds since last good read (None = never)
           hist_size_mb  float historian DB size in MB
           hist_last_s   float seconds since last historian write (None = never)
@@ -1042,19 +1607,23 @@ class SystemHealthWidget(tk.Frame):
           uptime_s      float app uptime in seconds
         """
         # COMM
-        cs = str(data.get("comm_state", "—") or "—").upper()
-        if "ONLINE" in cs:
-            self._set("comm", "ONLINE", self._good)
-        elif "RECOVERING" in cs:
+        cs = str(data.get("comm_state", "—") or "—")
+        cs_u = cs.upper()
+        if "LIVE" in cs_u or "ONLINE" in cs_u:
+            self._set("comm", "LIVE", self._good)
+        elif "RECONNECT" in cs_u or "RECOVER" in cs_u:
             self._set("comm", cs, self._warn)
-        elif "OFFLINE" in cs:
+        elif "OFFLINE" in cs_u or "NO DATA" in cs_u:
             self._set("comm", "OFFLINE", self._alarm)
         else:
-            self._set("comm", cs)
+            self._set("comm", cs_u)
 
         # LAST READ
         age = data.get("last_rx_age")
-        if age is None:
+        comm_detail = str(data.get("comm_detail", "") or "").strip()
+        if age is None and comm_detail:
+            self._set("last_rx", comm_detail, self._muted)
+        elif age is None:
             self._set("last_rx", "never", self._muted)
         elif age < 10:
             self._set("last_rx", f"{age:.1f}s ago", self._good)
@@ -1106,6 +1675,152 @@ class SystemHealthWidget(tk.Frame):
             self._set("uptime", f"{h}h {m:02d}m")
 
 
+class DashboardLayoutDialog(tk.Toplevel):
+    """Compact dialog for display-only dashboard layout controls."""
+
+    _CHART_LAYOUT_CHOICES = (
+        ("Both charts", "both"),
+        ("Left chart only", "chart1"),
+        ("Right chart only", "chart2"),
+    )
+
+    def __init__(self, parent, *, presets: Dict[str, dict], active_preset: str,
+                 settings: dict, on_apply, on_apply_preset, on_save_visible):
+        super().__init__(parent)
+        self.transient(parent)
+        self.title("Display Layout")
+        self.resizable(False, False)
+        self._presets = dict(presets or {})
+        self._preset_names = {k: str(v.get("label", k.title())) for k, v in self._presets.items()}
+        self._preset_labels = {v: k for k, v in self._preset_names.items()}
+        self._on_apply = on_apply
+        self._on_apply_preset = on_apply_preset
+        self._on_save_visible = on_save_visible
+
+        active_label = self._preset_names.get(active_preset, "")
+        self.preset_var = tk.StringVar(value=active_label)
+        self.surface_var = tk.StringVar(value=str(settings.get("surface", "tiles")))
+        self.tile_count_var = tk.IntVar(value=int(settings.get("tile_count", 12) or 12))
+        self.raw_numbers_var = tk.BooleanVar(value=bool(settings.get("raw_numbers", False)))
+        self._layout_label_to_value = {label: value for label, value in self._CHART_LAYOUT_CHOICES}
+        self._layout_value_to_label = {value: label for label, value in self._CHART_LAYOUT_CHOICES}
+        chart_layout = str(settings.get("chart_layout", "both") or "both").strip().lower()
+        self.chart_layout_var = tk.StringVar(value=self._layout_value_to_label.get(chart_layout, "Both charts"))
+        self.chart_share_var = tk.IntVar(value=int(settings.get("chart_share_pct", 65) or 65))
+        self.chart_share_text = tk.StringVar(value=f"{self.chart_share_var.get()}% chart area")
+
+        self._build()
+        self._sync_surface_state()
+        self.grab_set()
+        self.after(0, self.focus_force)
+
+    def _build(self):
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(body, text="Preset", style="TileTitle.TLabel").grid(row=0, column=0, sticky="w")
+        preset_values = [""] + [self._preset_names[k] for k in self._presets]
+        self.preset_combo = ttk.Combobox(body, state="readonly", values=preset_values, textvariable=self.preset_var, width=18)
+        self.preset_combo.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        ttk.Button(body, text="Apply Preset", command=self._apply_preset, style="Small.TButton").grid(row=0, column=2, sticky="ew")
+
+        ttk.Label(body, text="Display", style="TileTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        display_row = ttk.Frame(body)
+        display_row.grid(row=1, column=1, columnspan=2, sticky="w", pady=(10, 0))
+        for value, text in (("tiles", "Tiles"), ("gauges", "Round Gauge"), ("charts", "Charts Only")):
+            ttk.Radiobutton(display_row, text=text, value=value, variable=self.surface_var).pack(side="left", padx=(0, 10))
+
+        ttk.Label(body, text="Tile Count", style="TileTitle.TLabel").grid(row=2, column=0, sticky="w", pady=(12, 0))
+        self.tile_count_combo = ttk.Combobox(
+            body,
+            state="readonly",
+            values=[4, 6, 8, 10, 12, 14, 16],
+            textvariable=self.tile_count_var,
+            width=8,
+        )
+        self.tile_count_combo.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
+        self.raw_numbers_check = ttk.Checkbutton(body, text="Raw numbers", variable=self.raw_numbers_var)
+        self.raw_numbers_check.grid(row=2, column=2, sticky="w", pady=(10, 0))
+
+        ttk.Label(body, text="Charts", style="TileTitle.TLabel").grid(row=3, column=0, sticky="w", pady=(12, 0))
+        self.chart_layout_combo = ttk.Combobox(
+            body,
+            state="readonly",
+            values=[label for label, _value in self._CHART_LAYOUT_CHOICES],
+            textvariable=self.chart_layout_var,
+            width=18,
+        )
+        self.chart_layout_combo.grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
+        ttk.Label(body, text="Choose 1 or 2 trend charts.", style="TileUnit.TLabel").grid(row=3, column=2, sticky="w", pady=(10, 0))
+
+        ttk.Label(body, text="Chart Share", style="TileTitle.TLabel").grid(row=4, column=0, sticky="w", pady=(12, 0))
+        self.chart_share_scale = tk.Scale(
+            body,
+            from_=20,
+            to=80,
+            orient="horizontal",
+            variable=self.chart_share_var,
+            showvalue=True,
+            resolution=5,
+            length=220,
+            command=lambda _v: self.chart_share_text.set(f"{self.chart_share_var.get()}% chart area"),
+        )
+        self.chart_share_scale.grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        ttk.Label(body, textvariable=self.chart_share_text, style="TileUnit.TLabel").grid(row=4, column=2, sticky="w", pady=(10, 0))
+
+        btns = ttk.Frame(body)
+        btns.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(16, 0))
+        ttk.Button(btns, text="Save Visible Charts", command=self._save_visible, style="Small.TButton").pack(side="left")
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(btns, text="Apply", command=self._apply, style="Primary.TButton").pack(side="right", padx=(0, 8))
+
+        body.columnconfigure(1, weight=1)
+
+        self.surface_var.trace_add("write", lambda *_args: self._sync_surface_state())
+
+    def _set_state(self, widget, enabled: bool) -> None:
+        try:
+            widget.configure(state="normal" if enabled else "disabled")
+        except Exception:
+            pass
+
+    def _sync_surface_state(self) -> None:
+        surface = str(self.surface_var.get() or "tiles").strip().lower()
+        has_tiles = surface in {"tiles", "gauges"}
+        self._set_state(self.tile_count_combo, has_tiles)
+        self._set_state(self.raw_numbers_check, has_tiles)
+        self._set_state(self.chart_layout_combo, True)
+        self._set_state(self.chart_share_scale, True)
+
+    def _apply(self):
+        payload = {
+            "surface": self.surface_var.get(),
+            "tile_count": int(self.tile_count_var.get() or 12),
+            "raw_numbers": bool(self.raw_numbers_var.get()),
+            "chart_layout": self._layout_label_to_value.get(self.chart_layout_var.get(), "both"),
+            "chart_share_pct": int(self.chart_share_var.get() or 65),
+        }
+        try:
+            self._on_apply(payload)
+        except Exception:
+            pass
+
+    def _apply_preset(self):
+        key = self._preset_labels.get(str(self.preset_var.get() or ""))
+        if not key:
+            return
+        try:
+            self._on_apply_preset(str(key))
+        except Exception:
+            pass
+
+    def _save_visible(self):
+        try:
+            self._on_save_visible()
+        except Exception:
+            pass
+
+
 class DashboardTab(ttk.Frame):
     """
     Main dashboard tab with sub-tabs for TOTAL and individual meters.
@@ -1122,12 +1837,17 @@ class DashboardTab(ttk.Frame):
         alarm_engine: Optional[AlarmEngine] = None,
         event_journal=None,
         protection_engine=None,
+        on_save_config=None,
+        on_notify=None,
     ):
         super().__init__(parent, padding=8)
         self.meters = meters
         self.aggregator = aggregator
         self.selector = selector
         self.cfg = cfg
+        self.on_save_config = on_save_config
+        self.on_notify = on_notify
+        self._save_after_id = None
         self.alarm_engine = alarm_engine
         self.event_journal = event_journal
         self.protection_engine = protection_engine
@@ -1147,6 +1867,9 @@ class DashboardTab(ttk.Frame):
         # Status strip labels (quality + age)
         self._status_quality_lbls: Dict[Any, tk.Label] = {}
         self._status_age_lbls: Dict[Any, tk.Label] = {}
+        self._preset_buttons: Dict[Any, dict] = {}
+        self._focus_buttons: Dict[Any, tk.Widget] = {}
+        self._restore_surface_by_view: Dict[Any, str] = {}
         
         # Shared trend manager for all views
         max_win_min = 0
@@ -1191,6 +1914,320 @@ class DashboardTab(ttk.Frame):
             if m.meter_id == meter_id and m.values:
                 return list(m.values.keys())
         return COMMON_KEYS.copy()
+
+    def _dashboard_cfg(self) -> dict:
+        return self.cfg.setdefault("dashboard", {})
+
+    def _display_cfg(self, view_key) -> dict:
+        dash_cfg = self._dashboard_cfg()
+        cfg = dash_cfg.setdefault("display", {})
+        base = cfg.setdefault(str(view_key), {})
+        legacy_focus = bool((dash_cfg.get("charts_focus") or {}).get(str(view_key), False))
+        legacy_layout = str((dash_cfg.get("chart_layout") or {}).get(str(view_key), "both") or "both").strip().lower()
+        surface = str(base.get("surface", "tiles") or "tiles").strip().lower()
+        chart_layout = str(base.get("chart_layout", "both") or "both").strip().lower()
+        return {
+            "surface": (
+                surface if surface in {"tiles", "gauges", "charts"}
+                else ("charts" if legacy_focus else "tiles")
+            ),
+            "tile_count": max(1, min(16, int(base.get("tile_count", 12) or 12))),
+            "raw_numbers": bool(base.get("raw_numbers", False)),
+            "chart_layout": (
+                chart_layout if chart_layout in {"both", "chart1", "chart2"}
+                else (legacy_layout if legacy_layout in {"both", "chart1", "chart2"} else "both")
+            ),
+            "chart_share_pct": max(20, min(80, int(base.get("chart_share_pct", 65) or 65))),
+        }
+
+    def _set_display_cfg(self, view_key, patch: dict) -> None:
+        store = self._dashboard_cfg().setdefault("display", {}).setdefault(str(view_key), {})
+        for key, value in dict(patch or {}).items():
+            store[str(key)] = value
+
+    def _open_layout_dialog(self, view_key) -> None:
+        current = self._display_cfg(view_key)
+        active_preset = str((self._dashboard_cfg().get("active_preset") or {}).get(str(view_key), "") or "")
+        try:
+            existing = getattr(self, "_layout_dialog", None)
+            if existing is not None and existing.winfo_exists():
+                existing.lift()
+                existing.focus_force()
+                return
+        except Exception:
+            pass
+
+        def _apply_settings(payload: dict):
+            self._set_display_cfg(view_key, payload)
+            self._apply_view_layout(view_key)
+            self._schedule_config_save()
+
+        self._layout_dialog = DashboardLayoutDialog(
+            self,
+            presets=DASHBOARD_PRESETS,
+            active_preset=active_preset,
+            settings=current,
+            on_apply=_apply_settings,
+            on_apply_preset=lambda pk: self._apply_dashboard_preset(view_key, pk),
+            on_save_visible=lambda: self._save_visible_charts(view_key),
+        )
+
+    @staticmethod
+    def _toolbar_palette() -> dict:
+        try:
+            from ui.styles import get_theme
+            t = get_theme()
+            return {
+                "bg": t.card,
+                "fg": t.text,
+                "muted": t.text_muted,
+                "border": t.border,
+                "accent": t.accent,
+                "input_bg": t.input_bg,
+            }
+        except Exception:
+            return {
+                "bg": "#242426",
+                "fg": "#e8e4dc",
+                "muted": "#9a9490",
+                "border": "#38383a",
+                "accent": "#4da6ff",
+                "input_bg": "#1a1a1c",
+            }
+
+    def _schedule_config_save(self, delay_ms: int = 450) -> None:
+        """Debounce dashboard config writes from fast UI interactions."""
+        if not callable(self.on_save_config):
+            return
+        try:
+            if self._save_after_id:
+                self.after_cancel(self._save_after_id)
+        except Exception:
+            pass
+
+        def _do_save():
+            self._save_after_id = None
+            try:
+                self.on_save_config()
+            except Exception:
+                pass
+
+        try:
+            self._save_after_id = self.after(max(0, int(delay_ms)), _do_save)
+        except Exception:
+            _do_save()
+
+    def _notify(self, message: str) -> None:
+        if callable(self.on_notify):
+            try:
+                self.on_notify(str(message or ""))
+            except Exception:
+                pass
+
+    def _make_preset_toolbar(self, parent, view_key):
+        pal = self._toolbar_palette()
+        fg = pal["fg"]
+        border = pal["border"]
+        accent = pal["accent"]
+        input_bg = pal["input_bg"]
+
+        bar = tk.Frame(parent, bg=border, padx=1, pady=1)
+        # Floating controls: zero layout height, so the chart grid keeps the space.
+        bar.place(relx=1.0, x=-8, y=5, anchor="ne")
+
+        menu_btn = tk.Label(
+            bar,
+            text="Layout",
+            bg=input_bg,
+            fg=fg,
+            font=("Segoe UI", 8, "bold"),
+            padx=7,
+            pady=2,
+            cursor="hand2",
+        )
+        menu_btn.pack(side="left")
+        menu_btn.bind("<Button-1>", lambda _e, vk=view_key: self._open_layout_dialog(vk))
+        menu_btn.bind("<Enter>", lambda _e, w=menu_btn, a=accent: w.configure(bg=a, fg="#ffffff"))
+        menu_btn.bind("<Leave>", lambda _e, w=menu_btn, b=input_bg, f=fg: w.configure(bg=b, fg=f))
+        attach_tooltip(menu_btn, "Open all display layout options for this dashboard view.")
+        self._preset_buttons[view_key] = {"button": menu_btn}
+        try:
+            parent.bind("<Configure>", lambda _e, w=bar: w.lift(), add="+")
+        except Exception:
+            pass
+        return bar
+
+    def _refresh_preset_menu(self, view_key) -> None:
+        controls = self._preset_buttons.get(view_key) or {}
+        btn = controls.get("button") if isinstance(controls, dict) else None
+        if btn is None:
+            return
+        try:
+            active = str((self._dashboard_cfg().get("active_preset") or {}).get(str(view_key), "") or "")
+            label = "Layout"
+            if active:
+                label = f"Layout: {str(DASHBOARD_PRESETS.get(active, {}).get('label', active)).strip()[:10]}"
+            btn.configure(text=label)
+        except Exception:
+            pass
+
+    def _set_preset_active(self, view_key, preset_key: str) -> None:
+        key = str(view_key)
+        dash_cfg = self._dashboard_cfg()
+        active = dash_cfg.setdefault("active_preset", {})
+        active[key] = str(preset_key or "")
+        self._refresh_preset_menu(view_key)
+
+    def _apply_dashboard_preset(self, view_key, preset_key: str) -> None:
+        spec = DASHBOARD_PRESETS.get(str(preset_key or ""))
+        if not spec:
+            return
+        view = self._views.get(view_key)
+        if not view:
+            return
+        tiles, charts = view
+        try:
+            tiles.apply_keys(list(spec.get("tiles") or []))
+        except Exception:
+            pass
+        try:
+            charts.apply_preset(
+                list(spec.get("chart1") or []),
+                list(spec.get("chart2") or []),
+                int(spec.get("chart1_window", 60) or 60),
+                int(spec.get("chart2_window", 60) or 60),
+            )
+        except Exception:
+            pass
+        self._set_preset_active(view_key, str(preset_key))
+        self._schedule_config_save()
+
+    def _chart_focus_enabled(self, view_key) -> bool:
+        return self._display_cfg(view_key).get("surface") == "charts"
+
+    def _sync_chart_focus_button(self, view_key) -> None:
+        btn = self._focus_buttons.get(view_key)
+        if btn is None:
+            return
+        self._refresh_preset_menu(view_key)
+
+    def _apply_chart_focus(self, view_key) -> None:
+        view = self._views.get(view_key)
+        if not view:
+            return
+        tiles, _charts = view
+        surface = self._display_cfg(view_key).get("surface", "tiles")
+        try:
+            if surface == "charts":
+                tiles.grid_remove()
+            else:
+                tiles.grid()
+        except Exception:
+            pass
+        self._sync_chart_focus_button(view_key)
+
+    def _toggle_chart_focus(self, view_key) -> None:
+        try:
+            current = self._display_cfg(view_key).get("surface", "tiles")
+            if current == "charts":
+                restored = self._restore_surface_by_view.get(view_key, "tiles")
+                self._set_display_cfg(view_key, {"surface": restored})
+            else:
+                self._restore_surface_by_view[view_key] = current
+                self._set_display_cfg(view_key, {"surface": "charts"})
+        except Exception:
+            pass
+        self._apply_view_layout(view_key)
+        self._schedule_config_save()
+
+    def _chart_layout_mode(self, view_key) -> str:
+        mode = str(self._display_cfg(view_key).get("chart_layout", "both") or "both").strip().lower()
+        return mode if mode in {"both", "chart1", "chart2"} else "both"
+
+    def _apply_chart_layout(self, view_key) -> None:
+        self._apply_view_layout(view_key)
+
+    def _set_chart_layout(self, view_key, mode: str) -> None:
+        try:
+            clean = str(mode or "both").strip().lower()
+            self._set_display_cfg(view_key, {"chart_layout": clean if clean in {"both", "chart1", "chart2"} else "both"})
+        except Exception:
+            pass
+        self._apply_view_layout(view_key)
+        self._schedule_config_save()
+
+    def _apply_view_layout(self, view_key) -> None:
+        view = self._views.get(view_key)
+        frame = self._tab_frames.get(view_key)
+        if not view or frame is None:
+            return
+        tiles, pair = view
+        display = self._display_cfg(view_key)
+        try:
+            tiles.set_display_options(
+                tile_count=int(display.get("tile_count", 12) or 12),
+                style="gauges" if display.get("surface") == "gauges" else "tiles",
+                raw_numbers=bool(display.get("raw_numbers", False)),
+            )
+        except Exception:
+            pass
+        try:
+            pair.set_layout_mode(self._chart_layout_mode(view_key))
+        except Exception:
+            pass
+        try:
+            if display.get("surface") == "charts":
+                frame.rowconfigure(0, weight=0)
+                frame.rowconfigure(2, weight=100)
+            else:
+                chart_share = int(display.get("chart_share_pct", 65) or 65)
+                top_share = max(12, 100 - chart_share)
+                frame.rowconfigure(0, weight=top_share)
+                frame.rowconfigure(2, weight=chart_share)
+        except Exception:
+            pass
+        self._apply_chart_focus(view_key)
+        self._refresh_preset_menu(view_key)
+
+    def _save_visible_charts(self, view_key) -> None:
+        view = self._views.get(view_key)
+        if not view:
+            return
+        _tiles, pair = view
+        paths = []
+        try:
+            paths = pair.save_visible_snapshots()
+        except Exception:
+            paths = []
+        if paths:
+            self._notify(f"Saved {len(paths)} chart snapshot(s).")
+        else:
+            self._notify("No visible charts to save.")
+
+    def save_current_visible_charts(self) -> None:
+        key = self.current_view_key()
+        if key is not None:
+            self._save_visible_charts(key)
+
+    def current_view_key(self):
+        try:
+            selected = self.sub.select()
+            for key, frame in (self._tab_frames or {}).items():
+                if str(frame) == str(selected):
+                    return key
+        except Exception:
+            pass
+        return "TOTAL" if "TOTAL" in self._views else next(iter(self._views), None)
+
+    def set_current_chart_layout(self, mode: str) -> None:
+        key = self.current_view_key()
+        if key is not None:
+            self._set_chart_layout(key, mode)
+
+    def toggle_current_chart_focus(self) -> None:
+        key = self.current_view_key()
+        if key is not None:
+            self._toggle_chart_focus(key)
     
     def _build_tabs(self):
         """Build or rebuild sub-tabs."""
@@ -1202,16 +2239,19 @@ class DashboardTab(ttk.Frame):
         self._tab_names.clear()
         self._status_quality_lbls.clear()
         self._status_age_lbls.clear()
+        self._preset_buttons.clear()
+        self._focus_buttons.clear()
 
         # ---- helper: build one sub-tab ----------------------------------------
         def _make_tab(view_key, tab_text, tiles_cfg_key, get_keys_fn):
             frm = ttk.Frame(self.sub)
             self.sub.add(frm, text=tab_text)
-            frm.rowconfigure(3, weight=1)   # row 3 = charts (expands)
+            frm.rowconfigure(0, weight=35)
+            frm.rowconfigure(2, weight=65)   # row 2 = charts (expands)
             frm.columnconfigure(0, weight=1)
 
-            tiles = TilesPanel(frm, self.cfg, tiles_cfg_key, get_keys_fn)
-            tiles.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
+            tiles = TilesPanel(frm, self.cfg, tiles_cfg_key, get_keys_fn, on_config_change=self._schedule_config_save)
+            tiles.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 1))
 
             # ── Status strip (row=1): quality badge + data age + right-click hint ──
             try:
@@ -1222,37 +2262,44 @@ class DashboardTab(ttk.Frame):
             except Exception:
                 _panel_bg, _muted_fg, _dim_fg = "#1c1c1e", "#9a9490", "#5e5a56"
 
-            status_strip = tk.Frame(frm, bg=_panel_bg, height=20)
+            status_strip = tk.Frame(frm, bg=_panel_bg, height=0)
             status_strip.grid(row=1, column=0, sticky="ew", padx=4, pady=0)
+            status_strip.grid_remove()
             status_strip.grid_propagate(False)
 
             status_quality_lbl = tk.Label(
                 status_strip, text="● GOOD", bg=_panel_bg,
                 fg=QUALITY_COLORS.get("GOOD", "#34c768"),
-                font=("Segoe UI", 8, "bold"),
+                font=("Segoe UI", 7, "bold"),
             )
-            status_quality_lbl.pack(side="left", padx=(8, 12), pady=2)
+            status_quality_lbl.pack(side="left", padx=(8, 10), pady=1)
+            try:
+                status_quality_lbl.config(text="● GOOD")
+            except Exception:
+                pass
 
             status_age_lbl = tk.Label(
                 status_strip, text="", bg=_panel_bg,
-                fg=_muted_fg, font=("Segoe UI", 8),
+                fg=_muted_fg, font=("Segoe UI", 7),
             )
-            status_age_lbl.pack(side="left", padx=0, pady=2)
+            status_age_lbl.pack(side="left", padx=0, pady=1)
 
             status_hint = tk.Label(
-                status_strip, text="Right-click tile to change parameter",
+                status_strip, text="Right-click tile: parameter",
                 bg=_panel_bg, fg=_dim_fg, font=("Segoe UI", 7),
             )
-            status_hint.pack(side="right", padx=(0, 8), pady=2)
+            status_hint.pack(side="right", padx=(0, 8), pady=1)
 
-            # Fault banner row (row=2; hidden until alarms fire)
+            # Fault banner row (row=1; hidden until alarms fire)
             banner = FaultBannerFrame(frm)
-            banner.grid(row=2, column=0, sticky="ew", padx=4, pady=0)
+            banner.grid(row=1, column=0, sticky="ew", padx=4, pady=0)
+            banner.grid_remove()
 
             charts = TrendChartPair(
-                frm, self.cfg, tiles_cfg_key, get_keys_fn, self.trend_manager
+                frm, self.cfg, tiles_cfg_key, get_keys_fn, self.trend_manager,
+                on_config_change=self._schedule_config_save,
             )
-            charts.grid(row=3, column=0, sticky="nsew", padx=4, pady=4)
+            charts.grid(row=2, column=0, sticky="nsew", padx=4, pady=(0, 1))
 
             self._views[view_key]              = (tiles, charts)
             self._fault_banners[view_key]      = banner
@@ -1260,17 +2307,16 @@ class DashboardTab(ttk.Frame):
             self._tab_names[view_key]          = tab_text
             self._status_quality_lbls[view_key] = status_quality_lbl
             self._status_age_lbls[view_key]    = status_age_lbl
+            self._make_preset_toolbar(frm, view_key)
+            self._apply_view_layout(view_key)
         # -----------------------------------------------------------------------
 
         # TOTAL tab
         if self.selector.show_total():
             _make_tab("TOTAL", "TOTAL", "TOTAL", self._get_total_output_keys)
-            # Inject system health widget below charts for the TOTAL tab only
-            total_frm = self._tab_frames.get("TOTAL")
-            if total_frm is not None:
-                self._health_widget = SystemHealthWidget(total_frm)
-                self._health_widget.grid(row=4, column=0, sticky="ew", padx=4, pady=(0, 4))
-                total_frm.rowconfigure(4, weight=0)
+            # The bottom app StatusBar already carries COMM/LOG/uptime health.
+            # Keeping the dashboard chart area free gives operators more trend visibility.
+            self._health_widget = None
         else:
             self._health_widget = None
 
@@ -1322,6 +2368,7 @@ class DashboardTab(ttk.Frame):
         quality_name = (quality.value if hasattr(quality, "value") else str(quality or "GOOD")).upper()
         color = QUALITY_COLORS.get(quality_name, "#5e5a56")
         dot = "●"
+        dot = "●"
         try:
             q_lbl.config(text=f"{dot} {quality_name}", fg=color)
         except Exception:
@@ -1340,7 +2387,7 @@ class DashboardTab(ttk.Frame):
                 else:
                     age_text = f"Updated {age_s // 3600}h ago"
             else:
-                age_text = "Waiting for data..." if not data_valid else ""
+                age_text = ""
             age_lbl.config(text=age_text)
         except Exception:
             pass
